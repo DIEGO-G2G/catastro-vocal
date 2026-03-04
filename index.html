@@ -376,8 +376,11 @@
         }
         setPhase("processing"); setProcessingLabel("Interpretando la localización");
         try {
+          const controller = new AbortController();
+          const aiTimeout = setTimeout(() => controller.abort(), 15000);
           const resp = await fetch("https://api.openai.com/v1/chat/completions", {
             method:"POST",
+            signal: controller.signal,
             headers:{
               "Content-Type":"application/json",
               "Authorization":`Bearer ${unlockKey}`
@@ -390,6 +393,7 @@
               ]
             })
           });
+          clearTimeout(aiTimeout);
           if(!resp.ok){
             const errData = await resp.json().catch(()=>({error:{message:`HTTP ${resp.status}`}}));
             throw new Error(`OpenAI: ${errData?.error?.message||resp.status}`);
@@ -407,6 +411,24 @@
         }
       };
 
+      /* JSONP helper — bypasses CORS completely */
+      const jsonpFetch = (url) => new Promise((resolve, reject) => {
+        const cbName = "catastroJSONP_" + Date.now();
+        const script = document.createElement("script");
+        const timeout = setTimeout(() => {
+          cleanup(); reject(new Error("Timeout JSONP"));
+        }, 10000);
+        const cleanup = () => {
+          delete window[cbName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          clearTimeout(timeout);
+        };
+        window[cbName] = (data) => { cleanup(); resolve(data); };
+        script.onerror = () => { cleanup(); reject(new Error("Error cargando script JSONP")); };
+        script.src = url + "&callback=" + cbName;
+        document.head.appendChild(script);
+      });
+
       const queryCadastre = async (parsed) => {
         try {
           if (parsed.tipo === "refcat") {
@@ -414,13 +436,15 @@
             setPhase("result"); return;
           }
 
-          let baseUrl;
+          let jsonpUrl;
           if (parsed.tipo === "coordenadas") {
-            baseUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
-              + "?SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
+            jsonpUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
+              + "?SRS=EPSG:4326"
+              + "&Latitud=" + parsed.lat
+              + "&Longitud=" + parsed.lon;
           } else {
             const e = encodeURIComponent;
-            baseUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
+            jsonpUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
               + "?Provincia=" + e(parsed.provincia||"")
               + "&Municipio=" + e(parsed.municipio||"")
               + "&Sigla=" + e(parsed.tipovia||"CL")
@@ -429,35 +453,7 @@
               + "&Piso=" + e(parsed.piso||"");
           }
 
-          /* Try allorigins /get which wraps JSON in {contents:"..."} */
-          const proxies = [
-            async () => {
-              const r = await fetch("https://api.allorigins.win/get?url=" + encodeURIComponent(baseUrl), {cache:"no-store"});
-              if (!r.ok) throw new Error("allorigins " + r.status);
-              const j = await r.json();
-              return JSON.parse(j.contents);
-            },
-            async () => {
-              const r = await fetch("https://corsproxy.io/?" + encodeURIComponent(baseUrl), {cache:"no-store"});
-              if (!r.ok) throw new Error("corsproxy " + r.status);
-              return r.json();
-            },
-            async () => {
-              const r = await fetch("https://api.allorigins.win/raw?url=" + encodeURIComponent(baseUrl), {cache:"no-store"});
-              if (!r.ok) throw new Error("allorigins-raw " + r.status);
-              const txt = await r.text();
-              return JSON.parse(txt);
-            },
-          ];
-
-          let data = null;
-          let errors = [];
-          for (const proxy of proxies) {
-            try { data = await proxy(); if (data) break; }
-            catch(ex) { errors.push(ex.message); }
-          }
-
-          if (!data) throw new Error("Proxies: " + errors.join(" | "));
+          const data = await jsonpFetch(jsonpUrl);
 
           let rc = "", ldt = "", area = "", uso = "";
           if (parsed.tipo === "coordenadas") {
@@ -479,13 +475,10 @@
             setResult({ rc: rc.trim(), ldt, area, uso });
             setPhase("result");
           } else {
-            /* Proxy reached Catastro but address not found — show search page pre-filled */
-            const searchBase = "https://www1.sedecatastro.gob.es/cycbieninmueble/ovcbusqueda.aspx";
-            setResult({ rc: "", ldt: parsed.ldt||"Dirección no localizada automáticamente", area: "", uso: "", manualUrl: searchBase, parsed });
-            setPhase("result");
+            throw new Error("Dirección no encontrada en el Catastro");
           }
         } catch(e) {
-          setErrorMsg("Error consultando Catastro: " + e.message);
+          setErrorMsg("No se encontró la finca: " + e.message);
           setPhase("error");
         }
       };
@@ -760,19 +753,12 @@
 
   </script>
 
-  <!-- Service Worker para PWA offline -->
+  <!-- Unregister any old service workers to prevent stale cache -->
   <script>
     if ('serviceWorker' in navigator) {
-      const sw = `
-        const CACHE = 'catastro-v4';
-        const ASSETS = ['./', './index.html'];
-        self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS))));
-        self.addEventListener('fetch', e => e.respondWith(
-          caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match('./')))
-        ));
-      `;
-      const blob = new Blob([sw], {type:'application/javascript'});
-      navigator.serviceWorker.register(URL.createObjectURL(blob));
+      navigator.serviceWorker.getRegistrations().then(regs => {
+        regs.forEach(reg => reg.unregister());
+      });
     }
   </script>
 </body>
