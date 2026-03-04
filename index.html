@@ -421,7 +421,7 @@
         }
       };
 
-      /* ── Catastro via Cloudflare Worker (sin CORS) ── */
+      /* ── Catastro via Vercel API function (sin CORS) ── */
       const queryCadastre = async (parsed) => {
         try {
           if (parsed.tipo === "refcat") {
@@ -429,14 +429,14 @@
             setPhase("result"); return;
           }
 
-          let path;
+          const e = encodeURIComponent;
+          let apiUrl;
           if (parsed.tipo === "coordenadas") {
-            path = "/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
-              + "?SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
+            apiUrl = "/api/catastro?path=" + e("OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR")
+              + "&SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
           } else {
-            const e = encodeURIComponent;
-            path = "/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
-              + "?Provincia=" + e(parsed.provincia||"")
+            apiUrl = "/api/catastro?path=" + e("OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP")
+              + "&Provincia=" + e(parsed.provincia||"")
               + "&Municipio=" + e(parsed.municipio||"")
               + "&Sigla=" + e(parsed.tipovia||"CL")
               + "&Calle=" + e(parsed.nomvia||"")
@@ -444,8 +444,8 @@
               + "&Piso=" + e(parsed.piso||"");
           }
 
-          const resp = await fetch("https://catastro.dgallardo-at.workers.dev" + path);
-          if (!resp.ok) throw new Error("Worker HTTP " + resp.status);
+          const resp = await fetch(apiUrl);
+          if (!resp.ok) throw new Error("API HTTP " + resp.status);
           const data = await resp.json();
 
           let rc = "", ldt = "", area = "", uso = "";
