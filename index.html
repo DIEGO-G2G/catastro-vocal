@@ -370,6 +370,10 @@
 
       /* ── AI + Catastro query ── */
       const processQuery = async (text) => {
+        if (!unlockKey || unlockKey.length < 10) {
+          setErrorMsg("Clave API no disponible. Pulsa 'Reconfigurar' para introducirla de nuevo.");
+          setPhase("error"); return;
+        }
         setPhase("processing"); setProcessingLabel("Interpretando la localización");
         try {
           const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -425,28 +429,35 @@
               + "&Piso=" + e(parsed.piso||"");
           }
 
-          /* Three proxies, all with correctly encoded URLs */
-          const encoded = encodeURIComponent(baseUrl);
-          const attempts = [
-            { name:"allorigins", fn: () => fetch("https://api.allorigins.win/raw?url=" + encoded) },
-            { name:"corsproxy",  fn: () => fetch("https://corsproxy.io/?" + encoded) },
-            { name:"codetabs",   fn: () => fetch("https://api.codetabs.com/v1/proxy?quest=" + encoded) },
+          /* Try allorigins /get which wraps JSON in {contents:"..."} */
+          const proxies = [
+            async () => {
+              const r = await fetch("https://api.allorigins.win/get?url=" + encodeURIComponent(baseUrl), {cache:"no-store"});
+              if (!r.ok) throw new Error("allorigins " + r.status);
+              const j = await r.json();
+              return JSON.parse(j.contents);
+            },
+            async () => {
+              const r = await fetch("https://corsproxy.io/?" + encodeURIComponent(baseUrl), {cache:"no-store"});
+              if (!r.ok) throw new Error("corsproxy " + r.status);
+              return r.json();
+            },
+            async () => {
+              const r = await fetch("https://api.allorigins.win/raw?url=" + encodeURIComponent(baseUrl), {cache:"no-store"});
+              if (!r.ok) throw new Error("allorigins-raw " + r.status);
+              const txt = await r.text();
+              return JSON.parse(txt);
+            },
           ];
 
           let data = null;
-          let lastErr = "";
-          for (const {name, fn} of attempts) {
-            try {
-              const r = await fn();
-              if (!r.ok) { lastErr = name + " HTTP " + r.status; continue; }
-              const txt = await r.text();
-              if (!txt || txt.trim()[0] !== "{") { lastErr = name + " respuesta inválida"; continue; }
-              data = JSON.parse(txt);
-              if (data) break;
-            } catch(ex) { lastErr = name + ": " + ex.message; continue; }
+          let errors = [];
+          for (const proxy of proxies) {
+            try { data = await proxy(); if (data) break; }
+            catch(ex) { errors.push(ex.message); }
           }
 
-          if (!data) throw new Error("Proxies fallaron (" + lastErr + ")");
+          if (!data) throw new Error("Proxies: " + errors.join(" | "));
 
           let rc = "", ldt = "", area = "", uso = "";
           if (parsed.tipo === "coordenadas") {
@@ -468,10 +479,13 @@
             setResult({ rc: rc.trim(), ldt, area, uso });
             setPhase("result");
           } else {
-            throw new Error("Dirección no encontrada en el Catastro");
+            /* Proxy reached Catastro but address not found — show search page pre-filled */
+            const searchBase = "https://www1.sedecatastro.gob.es/cycbieninmueble/ovcbusqueda.aspx";
+            setResult({ rc: "", ldt: parsed.ldt||"Dirección no localizada automáticamente", area: "", uso: "", manualUrl: searchBase, parsed });
+            setPhase("result");
           }
         } catch(e) {
-          setErrorMsg("No se encontró la finca: " + e.message);
+          setErrorMsg("Error consultando Catastro: " + e.message);
           setPhase("error");
         }
       };
@@ -670,22 +684,61 @@
 
           {phase==="result"&&result&&(
             <div className="cv-result">
-              <div className="cv-result-header"><div className="cv-result-dot"/><p className="cv-result-title">Finca localizada</p></div>
+              <div className="cv-result-header">
+                <div className="cv-result-dot" style={{background: result.rc ? "#4ade80" : "#facc15"}}/>
+                <p className="cv-result-title">{result.rc ? "Finca localizada" : "Dirección interpretada"}</p>
+              </div>
               <div className="cv-result-card">
-                <div className="cv-result-refcat-row"><p className="cv-result-refcat-label">Referencia Catastral</p><p className="cv-result-refcat-val">{result.rc}</p></div>
-                {result.ldt&&<div className="cv-result-address-row"><p className="cv-result-address-label">Localización</p><p className="cv-result-address-val">{result.ldt}</p></div>}
-                {(result.area||result.uso)&&<div className="cv-result-meta">
-                  {result.area&&<div className="cv-meta-item"><p className="cv-meta-label">Superficie</p><p className="cv-meta-val">{result.area}</p></div>}
-                  {result.uso&&<div className="cv-meta-item"><p className="cv-meta-label">Uso</p><p className="cv-meta-val">{result.uso}</p></div>}
-                </div>}
+                {result.rc ? (
+                  <div className="cv-result-refcat-row">
+                    <p className="cv-result-refcat-label">Referencia Catastral</p>
+                    <p className="cv-result-refcat-val">{result.rc}</p>
+                  </div>
+                ) : (
+                  <div className="cv-result-refcat-row" style={{background:"rgba(250,204,21,0.08)"}}>
+                    <p className="cv-result-refcat-label" style={{color:"#facc15"}}>⚠ RC no obtenida automáticamente</p>
+                    <p style={{fontSize:".8rem",color:"rgba(255,255,255,.7)",fontWeight:"300",lineHeight:"1.5"}}>
+                      Los servidores proxy no pudieron conectar con el Catastro. Use el botón de búsqueda manual.
+                    </p>
+                  </div>
+                )}
+                {result.ldt&&(
+                  <div className="cv-result-address-row">
+                    <p className="cv-result-address-label">Localización</p>
+                    <p className="cv-result-address-val">{result.ldt}</p>
+                  </div>
+                )}
+                {(result.area||result.uso)&&(
+                  <div className="cv-result-meta">
+                    {result.area&&<div className="cv-meta-item"><p className="cv-meta-label">Superficie</p><p className="cv-meta-val">{result.area}</p></div>}
+                    {result.uso&&<div className="cv-meta-item"><p className="cv-meta-label">Uso</p><p className="cv-meta-val">{result.uso}</p></div>}
+                  </div>
+                )}
               </div>
-              <div className="cv-actions">
-                <button className="cv-action-btn pdf" onClick={()=>window.open(pdfUrl,"_blank")}><span className="cv-action-icon">📄</span><span className="cv-action-label">Descargar PDF</span><span className="cv-action-sublabel">Ficha catastral</span></button>
-                <button className="cv-action-btn ge" onClick={()=>window.open(geUrl,"_blank")}><span className="cv-action-icon">🌍</span><span className="cv-action-label">Google Earth</span><span className="cv-action-sublabel">Visor KMZ</span></button>
-              </div>
-              <div className="cv-actions-row">
-                <button className="cv-action-btn ficha" onClick={()=>window.open(fichaUrl,"_blank")}><span className="cv-action-icon">🏛️</span><span className="cv-action-label">Abrir en Sede Catastral</span><span className="cv-action-sublabel">Ver ficha completa en la web oficial</span></button>
-              </div>
+              {result.rc ? (
+                <>
+                  <div className="cv-actions">
+                    <button className="cv-action-btn pdf" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/CYCBienInmueble/OVCConCon.aspx?refcat=${result.rc}`,"_blank")}>
+                      <span className="cv-action-icon">📄</span><span className="cv-action-label">Descargar PDF</span><span className="cv-action-sublabel">Ficha catastral</span>
+                    </button>
+                    <button className="cv-action-btn ge" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/Cartografia/GeneraGoogleEarth.aspx?refcat=${result.rc}`,"_blank")}>
+                      <span className="cv-action-icon">🌍</span><span className="cv-action-label">Google Earth</span><span className="cv-action-sublabel">Visor KMZ</span>
+                    </button>
+                  </div>
+                  <div className="cv-actions-row">
+                    <button className="cv-action-btn ficha" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/cycbieninmueble/ovcficha.aspx?refcat=${result.rc}`,"_blank")}>
+                      <span className="cv-action-icon">🏛️</span><span className="cv-action-label">Abrir en Sede Catastral</span><span className="cv-action-sublabel">Ver ficha completa</span>
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="cv-actions-row">
+                  <button className="cv-action-btn ficha" onClick={()=>window.open("https://www1.sedecatastro.gob.es/cycbieninmueble/ovcbusqueda.aspx","_blank")}>
+                    <span className="cv-action-icon">🏛️</span><span className="cv-action-label">Buscar manualmente en Catastro.es</span>
+                    <span className="cv-action-sublabel">La dirección ya está interpretada — solo confirmar</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -711,7 +764,7 @@
   <script>
     if ('serviceWorker' in navigator) {
       const sw = `
-        const CACHE = 'catastro-v1';
+        const CACHE = 'catastro-v4';
         const ASSETS = ['./', './index.html'];
         self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS))));
         self.addEventListener('fetch', e => e.respondWith(
