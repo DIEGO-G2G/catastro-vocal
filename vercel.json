@@ -1,7 +1,1 @@
-{
-  "functions": {
-    "api/catastro.js": {
-      "runtime": "@vercel/node@3"
-    }
-  }
-}
+{}
