@@ -421,7 +421,7 @@
         }
       };
 
-      /* ── Catastro via Vercel API function (sin CORS) ── */
+      /* ── Catastro via Cloudflare Worker (sin CORS) ── */
       const queryCadastre = async (parsed) => {
         try {
           if (parsed.tipo === "refcat") {
@@ -429,14 +429,14 @@
             setPhase("result"); return;
           }
 
-          const e = encodeURIComponent;
-          let apiUrl;
+          let path;
           if (parsed.tipo === "coordenadas") {
-            apiUrl = "/api/catastro?path=" + e("OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR")
-              + "&SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
+            path = "/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
+              + "?SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
           } else {
-            apiUrl = "/api/catastro?path=" + e("OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP")
-              + "&Provincia=" + e(parsed.provincia||"")
+            const e = encodeURIComponent;
+            path = "/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
+              + "?Provincia=" + e(parsed.provincia||"")
               + "&Municipio=" + e(parsed.municipio||"")
               + "&Sigla=" + e(parsed.tipovia||"CL")
               + "&Calle=" + e(parsed.nomvia||"")
@@ -444,8 +444,8 @@
               + "&Piso=" + e(parsed.piso||"");
           }
 
-          const resp = await fetch(apiUrl);
-          if (!resp.ok) throw new Error("API HTTP " + resp.status);
+          const resp = await fetch("https://catastro.dgallardo-at.workers.dev" + path);
+          if (!resp.ok) throw new Error("Worker HTTP " + resp.status);
           const data = await resp.json();
 
           let rc = "", ldt = "", area = "", uso = "";
@@ -468,7 +468,13 @@
             setResult({ rc: rc.trim(), ldt, area, uso });
             setPhase("result");
           } else {
-            throw new Error("Dirección no encontrada en el Catastro");
+            // Check for specific Catastro error codes
+            const lerr = data?.consulta_dnpppResult?.control?.lerr;
+            const cod = Array.isArray(lerr) ? lerr[0]?.cod : lerr?.cod;
+            if (cod === "61" || cod === 61) {
+              throw new Error("Esta dirección corresponde a una finca rústica. Las fincas rústicas no tienen dirección postal — búscala por coordenadas GPS (ej: 36.4087, -6.1234) o por polígono/parcela.");
+            }
+            throw new Error("Dirección no encontrada. Compruebe que es correcta o pruebe con coordenadas GPS.");
           }
         } catch(e) {
           setErrorMsg("Error: " + e.message);
@@ -742,4 +748,95 @@
     }
   </script>
 </body>
-</html>
+</html>      /* ── Geocodificación con Nominatim (fallback fincas rústicas) ── */
+      const geocodeAddress = async (parsed) => {
+        const query = [parsed.nomvia, parsed.numero, parsed.municipio, parsed.provincia, "España"]
+          .filter(Boolean).join(", ");
+        const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + encodeURIComponent(query);
+        const r = await fetch(url, { headers: { "Accept-Language": "es", "User-Agent": "CatastroVocal/1.0" } });
+        const data = await r.json();
+        if (data?.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+        throw new Error("No se pudo geocodificar la dirección");
+      };
+
+      /* ── Consulta por coordenadas ── */
+      const queryByCoords = async (lat, lon) => {
+        const apiUrl = "/api/catastro?path=" + encodeURIComponent("OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR")
+          + "&SRS=EPSG:4326&Latitud=" + lat + "&Longitud=" + lon;
+        const r = await fetch(apiUrl);
+        if (!r.ok) throw new Error("API coords HTTP " + r.status);
+        const data = await r.json();
+        const c = data?.consulta_coordenadasResult?.coordenadas?.coord;
+        if (c?.pc) {
+          return { rc: (c.pc.pc1||"") + (c.pc.pc2||""), ldt: c.ldt||"" };
+        }
+        throw new Error("No se encontró RC por coordenadas");
+      };
+
+      /* ── Catastro via Vercel API function (sin CORS) ── */
+      const queryCadastre = async (parsed) => {
+        try {
+          if (parsed.tipo === "refcat") {
+            setResult({ rc: parsed.rc.trim(), ldt: "Referencia catastral directa", area: "", uso: "" });
+            setPhase("result"); return;
+          }
+
+          /* Búsqueda directa por coordenadas */
+          if (parsed.tipo === "coordenadas") {
+            setProcessingLabel("Consultando el Catastro");
+            const res = await queryByCoords(parsed.lat, parsed.lon);
+            setResult({ rc: res.rc.trim(), ldt: res.ldt, area: "", uso: "" });
+            setPhase("result"); return;
+          }
+
+          /* Búsqueda por dirección postal */
+          const e = encodeURIComponent;
+          const apiUrl = "/api/catastro?path=" + e("OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP")
+            + "&Provincia=" + e(parsed.provincia||"")
+            + "&Municipio=" + e(parsed.municipio||"")
+            + "&Sigla=" + e(parsed.tipovia||"CL")
+            + "&Calle=" + e(parsed.nomvia||"")
+            + "&Numero=" + e(parsed.numero||"")
+            + "&Piso=" + e(parsed.piso||"");
+
+          const resp = await fetch(apiUrl);
+          if (!resp.ok) throw new Error("API HTTP " + resp.status);
+          const data = await resp.json();
+
+          /* Comprobar error de finca rústica */
+          const lerr = data?.consulta_dnpppResult?.control?.lerr;
+          const cod = Array.isArray(lerr) ? lerr[0]?.cod : lerr?.cod;
+          if (cod === "61" || cod === 61) {
+            /* Finca rústica — geocodificar y buscar por coordenadas */
+            setProcessingLabel("Finca rústica — obteniendo coordenadas");
+            const coords = await geocodeAddress(parsed);
+            setProcessingLabel("Consultando el Catastro por coordenadas");
+            const res = await queryByCoords(coords.lat, coords.lon);
+            setResult({ rc: res.rc.trim(), ldt: res.ldt, area: "", uso: "" });
+            setPhase("result"); return;
+          }
+
+          /* Dirección urbana normal */
+          const res2 = data?.consulta_dnpppResult;
+          let bi = res2?.bico?.bi;
+          if (Array.isArray(bi)) bi = bi[0];
+          if (bi?.idbi?.rc?.pc1) {
+            const rc = (bi.idbi.rc.pc1||"") + (bi.idbi.rc.pc2||"");
+            const ldt = bi.dt?.ldt||"";
+            const area = bi.debi?.sfc ? bi.debi.sfc + " m²" : "";
+            const uso = bi.debi?.luso||"";
+            if (rc.trim().length >= 14) {
+              setResult({ rc: rc.trim(), ldt, area, uso });
+              setPhase("result"); return;
+            }
+          }
+
+          throw new Error("Dirección no encontrada. Compruebe que es correcta o pruebe con coordenadas GPS.");
+
+        } catch(ex) {
+          setErrorMsg("Error: " + ex.message);
+          setPhase("error");
+        }
+      };
+
+
