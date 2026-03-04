@@ -1,5 +1,7 @@
 {
   "functions": {
-    "api/catastro.js": { "runtime": "nodejs20.x" }
+    "api/catastro.js": {
+      "runtime": "@vercel/node@3"
+    }
   }
 }
