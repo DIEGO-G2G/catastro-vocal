@@ -374,23 +374,32 @@
         try {
           const resp = await fetch("https://api.openai.com/v1/chat/completions", {
             method:"POST",
-            headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${unlockKey}` },
+            headers:{
+              "Content-Type":"application/json",
+              "Authorization":`Bearer ${unlockKey}`
+            },
             body: JSON.stringify({
               model:"gpt-4o-mini", max_tokens:400,
               messages:[
-                { role:"system", content:"Eres un analizador de localizaciones españolas. Responde SOLO JSON válido, sin backticks ni texto adicional.\nDirección postal: {\"tipo\":\"direccion\",\"provincia\":\"PROV\",\"municipio\":\"MUN\",\"tipovia\":\"CL\",\"nomvia\":\"NOMBRE\",\"numero\":\"N\",\"piso\":\"\"}\nTipos de vía → CL=Calle, AV=Avenida, PL=Plaza, CM=Camino, PS=Paseo, CR=Carretera, GL=Glorieta, TR=Travesía, RD=Ronda\nCoordenadas WGS84: {\"tipo\":\"coordenadas\",\"lat\":40.0000,\"lon\":-3.0000}\nReferencia catastral (14-20 chars): {\"tipo\":\"refcat\",\"rc\":\"XXXXXXXX\"}\nNo reconocido: {\"tipo\":\"error\",\"msg\":\"desc\"}\nREGLAS: MAYÚSCULAS, sin acentos en campos de dirección, infiere provincia si no se menciona." },
+                { role:"system", content:"Eres un analizador de localizaciones españolas. Responde SOLO JSON valido sin markdown.\nDireccion: {tipo:direccion,provincia:PROV,municipio:MUN,tipovia:CL,nomvia:NOMBRE,numero:N,piso:}\nVias: CL=Calle AV=Avenida PL=Plaza CM=Camino PS=Paseo CR=Carretera GL=Glorieta TR=Travesia RD=Ronda\nCoordenadas: {tipo:coordenadas,lat:40.0,lon:-3.0}\nRefCatastral: {tipo:refcat,rc:XXXX}\nError: {tipo:error,msg:texto}\nREGLAS: MAYUSCULAS, sin acentos, infiere provincia." },
                 { role:"user", content:text }
               ]
             })
           });
-          const data=await resp.json();
-          const raw=data.choices?.[0]?.message?.content?.replace(/```json?\n?|```/g,"").trim();
-          const parsed=JSON.parse(raw);
+          if(!resp.ok){
+            const errData = await resp.json().catch(()=>({error:{message:`HTTP ${resp.status}`}}));
+            throw new Error(`OpenAI: ${errData?.error?.message||resp.status}`);
+          }
+          const data = await resp.json();
+          const raw = (data.choices?.[0]?.message?.content||"").replace(/```[a-z]*\n?|```/g,"").trim();
+          let parsed;
+          try { parsed = JSON.parse(raw); }
+          catch(pe) { throw new Error(`Respuesta inesperada de IA: ${raw.slice(0,60)}`); }
           if(parsed.tipo==="error"){ setErrorMsg(parsed.msg||"No se pudo interpretar la localización."); setPhase("error"); return; }
           setProcessingLabel("Consultando el Catastro");
           await queryCadastre(parsed);
         } catch(e) {
-          setErrorMsg("Error al interpretar. Verifique su conexión."); setPhase("error");
+          setErrorMsg(`Error IA: ${e.message}`); setPhase("error");
         }
       };
 
@@ -400,47 +409,58 @@
             setResult({ rc: parsed.rc.trim(), ldt: "Referencia catastral directa", area: "", uso: "" });
             setPhase("result"); return;
           }
+
           let baseUrl;
           if (parsed.tipo === "coordenadas") {
-            baseUrl = `https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR?SRS=EPSG:4326&Latitud=${parsed.lat}&Longitud=${parsed.lon}`;
+            baseUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
+              + "?SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
           } else {
-            const enc = (v) => encodeURIComponent(v || "");
-            baseUrl = `https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP?Provincia=${enc(parsed.provincia)}&Municipio=${enc(parsed.municipio)}&Sigla=${enc(parsed.tipovia || "CL")}&Calle=${enc(parsed.nomvia)}&Numero=${enc(parsed.numero)}&Piso=${enc(parsed.piso)}`;
+            const e = encodeURIComponent;
+            baseUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
+              + "?Provincia=" + e(parsed.provincia||"")
+              + "&Municipio=" + e(parsed.municipio||"")
+              + "&Sigla=" + e(parsed.tipovia||"CL")
+              + "&Calle=" + e(parsed.nomvia||"")
+              + "&Numero=" + e(parsed.numero||"")
+              + "&Piso=" + e(parsed.piso||"");
           }
 
-          /* Try three different CORS proxy approaches */
+          /* Three proxies, all with correctly encoded URLs */
+          const encoded = encodeURIComponent(baseUrl);
           const attempts = [
-            () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(baseUrl)}`),
-            () => fetch(`https://corsproxy.io/?${baseUrl}`),
-            () => fetch(`https://thingproxy.freeboard.io/fetch/${baseUrl}`),
+            { name:"allorigins", fn: () => fetch("https://api.allorigins.win/raw?url=" + encoded) },
+            { name:"corsproxy",  fn: () => fetch("https://corsproxy.io/?" + encoded) },
+            { name:"codetabs",   fn: () => fetch("https://api.codetabs.com/v1/proxy?quest=" + encoded) },
           ];
 
           let data = null;
-          for (const attempt of attempts) {
+          let lastErr = "";
+          for (const {name, fn} of attempts) {
             try {
-              const r = await attempt();
-              if (!r.ok) continue;
+              const r = await fn();
+              if (!r.ok) { lastErr = name + " HTTP " + r.status; continue; }
               const txt = await r.text();
+              if (!txt || txt.trim()[0] !== "{") { lastErr = name + " respuesta inválida"; continue; }
               data = JSON.parse(txt);
               if (data) break;
-            } catch(_) { continue; }
+            } catch(ex) { lastErr = name + ": " + ex.message; continue; }
           }
 
-          if (!data) throw new Error("Sin datos");
+          if (!data) throw new Error("Proxies fallaron (" + lastErr + ")");
 
           let rc = "", ldt = "", area = "", uso = "";
           if (parsed.tipo === "coordenadas") {
             const c = data?.consulta_coordenadasResult?.coordenadas?.coord;
-            if (c?.pc) { rc = (c.pc.pc1 || "") + (c.pc.pc2 || ""); ldt = c.ldt || ""; }
+            if (c?.pc) { rc = (c.pc.pc1||"") + (c.pc.pc2||""); ldt = c.ldt||""; }
           } else {
             const res = data?.consulta_dnpppResult;
             let bi = res?.bico?.bi;
             if (Array.isArray(bi)) bi = bi[0];
             if (bi?.idbi?.rc?.pc1) {
-              rc = (bi.idbi.rc.pc1 || "") + (bi.idbi.rc.pc2 || "");
-              ldt = bi.dt?.ldt || "";
-              area = bi.debi?.sfc ? `${bi.debi.sfc} m²` : "";
-              uso = bi.debi?.luso || "";
+              rc = (bi.idbi.rc.pc1||"") + (bi.idbi.rc.pc2||"");
+              ldt = bi.dt?.ldt||"";
+              area = bi.debi?.sfc ? bi.debi.sfc + " m²" : "";
+              uso = bi.debi?.luso||"";
             }
           }
 
@@ -451,7 +471,7 @@
             throw new Error("Dirección no encontrada en el Catastro");
           }
         } catch(e) {
-          setErrorMsg(`No se encontró la finca: ${e.message}. Compruebe que la dirección es correcta o pruebe con coordenadas.`);
+          setErrorMsg("No se encontró la finca: " + e.message);
           setPhase("error");
         }
       };
@@ -637,7 +657,16 @@
 
           {phase==="processing"&&<div className="cv-processing"><div className="cv-spinner"/><p className="cv-processing-text cv-dots">{processingLabel}</p></div>}
 
-          {phase==="error"&&<div className="cv-error-card"><p className="cv-error-title">Error en la búsqueda</p><p className="cv-error-msg">{errorMsg}</p></div>}
+          {phase==="error"&&(
+            <div className="cv-error-card">
+              <p className="cv-error-title">Error en la búsqueda</p>
+              <p className="cv-error-msg">{errorMsg}</p>
+              <button onClick={()=>window.open("https://www1.sedecatastro.gob.es/cycbieninmueble/ovcbusqueda.aspx","_blank")}
+                style={{marginTop:"1rem",width:"100%",background:"rgba(59,130,246,0.15)",border:"1px solid rgba(59,130,246,0.4)",borderRadius:"8px",padding:".65rem",color:"#93c5fd",fontFamily:"'Outfit',sans-serif",fontSize:".78rem",cursor:"pointer",letterSpacing:".05em"}}>
+                🏛️ Abrir búsqueda manual en Catastro.es
+              </button>
+            </div>
+          )}
 
           {phase==="result"&&result&&(
             <div className="cv-result">
