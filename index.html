@@ -8,7 +8,10 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="apple-mobile-web-app-title" content="Catastro Vocal"/>
   <meta name="mobile-web-app-capable" content="yes"/>
-  <meta name="description" content="Localizador catastral por reconocimiento de voz"/>
+  <meta name="description" content="Localizador catastral por reconocimiento de voz v5"/>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
+  <meta http-equiv="Pragma" content="no-cache"/>
+  <meta http-equiv="Expires" content="0"/>
   <title>Catastro Vocal</title>
 
   <!-- PWA Manifest inline -->
@@ -407,28 +410,18 @@
           setProcessingLabel("Consultando el Catastro");
           await queryCadastre(parsed);
         } catch(e) {
-          setErrorMsg(`Error IA: ${e.message}`); setPhase("error");
+          if (e.name === "AbortError") {
+            setErrorMsg("Tiempo de espera agotado. Compruebe su conexión a internet.");
+          } else if (e.message.includes("fetch") || e.message.includes("network") || e.message.includes("Failed")) {
+            setErrorMsg("Error de red al conectar con OpenAI. Si acaba de reconfigurar la app, vuelva a introducir su clave API pulsando 'Reconfigurar' abajo.");
+          } else {
+            setErrorMsg("Error IA: " + e.message);
+          }
+          setPhase("error");
         }
       };
 
-      /* JSONP helper — bypasses CORS completely */
-      const jsonpFetch = (url) => new Promise((resolve, reject) => {
-        const cbName = "catastroJSONP_" + Date.now();
-        const script = document.createElement("script");
-        const timeout = setTimeout(() => {
-          cleanup(); reject(new Error("Timeout JSONP"));
-        }, 10000);
-        const cleanup = () => {
-          delete window[cbName];
-          if (script.parentNode) script.parentNode.removeChild(script);
-          clearTimeout(timeout);
-        };
-        window[cbName] = (data) => { cleanup(); resolve(data); };
-        script.onerror = () => { cleanup(); reject(new Error("Error cargando script JSONP")); };
-        script.src = url + "&callback=" + cbName;
-        document.head.appendChild(script);
-      });
-
+      /* ── Catastro via Cloudflare Worker (sin CORS) ── */
       const queryCadastre = async (parsed) => {
         try {
           if (parsed.tipo === "refcat") {
@@ -436,15 +429,13 @@
             setPhase("result"); return;
           }
 
-          let jsonpUrl;
+          let path;
           if (parsed.tipo === "coordenadas") {
-            jsonpUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
-              + "?SRS=EPSG:4326"
-              + "&Latitud=" + parsed.lat
-              + "&Longitud=" + parsed.lon;
+            path = "/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR"
+              + "?SRS=EPSG:4326&Latitud=" + parsed.lat + "&Longitud=" + parsed.lon;
           } else {
             const e = encodeURIComponent;
-            jsonpUrl = "https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
+            path = "/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP"
               + "?Provincia=" + e(parsed.provincia||"")
               + "&Municipio=" + e(parsed.municipio||"")
               + "&Sigla=" + e(parsed.tipovia||"CL")
@@ -453,7 +444,9 @@
               + "&Piso=" + e(parsed.piso||"");
           }
 
-          const data = await jsonpFetch(jsonpUrl);
+          const resp = await fetch("https://catastro.dgallardo-at.workers.dev" + path);
+          if (!resp.ok) throw new Error("Worker HTTP " + resp.status);
+          const data = await resp.json();
 
           let rc = "", ldt = "", area = "", uso = "";
           if (parsed.tipo === "coordenadas") {
@@ -478,10 +471,11 @@
             throw new Error("Dirección no encontrada en el Catastro");
           }
         } catch(e) {
-          setErrorMsg("No se encontró la finca: " + e.message);
+          setErrorMsg("Error: " + e.message);
           setPhase("error");
         }
       };
+
 
       const reset=()=>{ setPhase("idle");setTranscript("");setInterim("");setResult(null);setErrorMsg("");setManualText("");transcriptAcc.current=""; };
 
@@ -678,23 +672,14 @@
           {phase==="result"&&result&&(
             <div className="cv-result">
               <div className="cv-result-header">
-                <div className="cv-result-dot" style={{background: result.rc ? "#4ade80" : "#facc15"}}/>
-                <p className="cv-result-title">{result.rc ? "Finca localizada" : "Dirección interpretada"}</p>
+                <div className="cv-result-dot"/>
+                <p className="cv-result-title">Finca catastral localizada</p>
               </div>
               <div className="cv-result-card">
-                {result.rc ? (
-                  <div className="cv-result-refcat-row">
-                    <p className="cv-result-refcat-label">Referencia Catastral</p>
-                    <p className="cv-result-refcat-val">{result.rc}</p>
-                  </div>
-                ) : (
-                  <div className="cv-result-refcat-row" style={{background:"rgba(250,204,21,0.08)"}}>
-                    <p className="cv-result-refcat-label" style={{color:"#facc15"}}>⚠ RC no obtenida automáticamente</p>
-                    <p style={{fontSize:".8rem",color:"rgba(255,255,255,.7)",fontWeight:"300",lineHeight:"1.5"}}>
-                      Los servidores proxy no pudieron conectar con el Catastro. Use el botón de búsqueda manual.
-                    </p>
-                  </div>
-                )}
+                <div className="cv-result-refcat-row">
+                  <p className="cv-result-refcat-label">Referencia Catastral</p>
+                  <p className="cv-result-refcat-val">{result.rc}</p>
+                </div>
                 {result.ldt&&(
                   <div className="cv-result-address-row">
                     <p className="cv-result-address-label">Localización</p>
@@ -708,30 +693,25 @@
                   </div>
                 )}
               </div>
-              {result.rc ? (
-                <>
-                  <div className="cv-actions">
-                    <button className="cv-action-btn pdf" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/CYCBienInmueble/OVCConCon.aspx?refcat=${result.rc}`,"_blank")}>
-                      <span className="cv-action-icon">📄</span><span className="cv-action-label">Descargar PDF</span><span className="cv-action-sublabel">Ficha catastral</span>
-                    </button>
-                    <button className="cv-action-btn ge" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/Cartografia/GeneraGoogleEarth.aspx?refcat=${result.rc}`,"_blank")}>
-                      <span className="cv-action-icon">🌍</span><span className="cv-action-label">Google Earth</span><span className="cv-action-sublabel">Visor KMZ</span>
-                    </button>
-                  </div>
-                  <div className="cv-actions-row">
-                    <button className="cv-action-btn ficha" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/cycbieninmueble/ovcficha.aspx?refcat=${result.rc}`,"_blank")}>
-                      <span className="cv-action-icon">🏛️</span><span className="cv-action-label">Abrir en Sede Catastral</span><span className="cv-action-sublabel">Ver ficha completa</span>
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className="cv-actions-row">
-                  <button className="cv-action-btn ficha" onClick={()=>window.open("https://www1.sedecatastro.gob.es/cycbieninmueble/ovcbusqueda.aspx","_blank")}>
-                    <span className="cv-action-icon">🏛️</span><span className="cv-action-label">Buscar manualmente en Catastro.es</span>
-                    <span className="cv-action-sublabel">La dirección ya está interpretada — solo confirmar</span>
-                  </button>
-                </div>
-              )}
+              <div className="cv-actions">
+                <button className="cv-action-btn pdf" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/CYCBienInmueble/OVCConCon.aspx?refcat=${result.rc}`,"_blank")}>
+                  <span className="cv-action-icon">📄</span>
+                  <span className="cv-action-label">Descargar PDF</span>
+                  <span className="cv-action-sublabel">Ficha catastral</span>
+                </button>
+                <button className="cv-action-btn ge" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/Cartografia/GeneraGoogleEarth.aspx?refcat=${result.rc}`,"_blank")}>
+                  <span className="cv-action-icon">🌍</span>
+                  <span className="cv-action-label">Google Earth</span>
+                  <span className="cv-action-sublabel">Visor KMZ</span>
+                </button>
+              </div>
+              <div className="cv-actions-row">
+                <button className="cv-action-btn ficha" onClick={()=>window.open(`https://www1.sedecatastro.gob.es/cycbieninmueble/ovcficha.aspx?refcat=${result.rc}`,"_blank")}>
+                  <span className="cv-action-icon">🏛️</span>
+                  <span className="cv-action-label">Abrir en Sede Catastral</span>
+                  <span className="cv-action-sublabel">Ficha completa oficial</span>
+                </button>
+              </div>
             </div>
           )}
 
