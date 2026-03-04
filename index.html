@@ -245,14 +245,23 @@
         if (!SR) { setSpeechAvail(false); return; }
         const rec = new SR();
         rec.lang="es-ES"; rec.continuous=true; rec.interimResults=true; rec.maxAlternatives=1;
+        if(!rec._addedT) rec._addedT = new Set(); const addedTranscripts = rec._addedT;
         rec.onresult = (e) => {
           let int="";
           for (let i=e.resultIndex;i<e.results.length;i++) {
-            if (e.results[i].isFinal) { transcriptAcc.current+=e.results[i][0].transcript+" "; setTranscript(transcriptAcc.current); }
-            else int+=e.results[i][0].transcript;
+            if (e.results[i].isFinal) {
+              const t = e.results[i][0].transcript;
+              const key = i+":"+t.trim().slice(0,20);
+              if (!rec._addedT.has(key)) {
+                rec._addedT.add(key);
+                transcriptAcc.current+=t+" ";
+                setTranscript(transcriptAcc.current);
+              }
+            } else { int+=e.results[i][0].transcript; }
           }
           setInterim(int);
         };
+
         rec.onend=()=>{ if(listenRef.current) setTimeout(()=>{ if(listenRef.current) try{rec.start();}catch(_){} },150); };
         rec.onerror=(e)=>{ if(e.error==="no-speech"||e.error==="aborted") return; };
         recRef.current=rec;
@@ -311,7 +320,7 @@
           const text=transcriptAcc.current.trim();
           if(text) processQuery(text); else setPhase("idle");
         } else {
-          transcriptAcc.current=""; setTranscript(""); setInterim(""); setResult(null); setErrorMsg("");
+          transcriptAcc.current=""; setTranscript(""); setInterim(""); setResult(null); setErrorMsg(""); if(recRef.current) recRef.current._addedT=new Set();
           setPhase("listening"); setIsListening(true); listenRef.current=true;
           try{recRef.current?.start();}catch(_){}
         }
@@ -353,10 +362,10 @@
           if(parsed.tipo==="refcat"){ setResult({rc:parsed.rc.trim(),ldt:"Referencia catastral directa",area:"",uso:""}); setPhase("result"); return; }
           let url;
           if(parsed.tipo==="coordenadas") {
-            url=`https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR?SRS=EPSG:4326&Latitud=${parsed.lat}&Longitud=${parsed.lon}`;
+            url=`https://corsproxy.io/?https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR?SRS=EPSG:4326&Latitud=${parsed.lat}&Longitud=${parsed.lon}`;
           } else {
             const enc=(v)=>encodeURIComponent(v||"");
-            url=`https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP?Provincia=${enc(parsed.provincia)}&Municipio=${enc(parsed.municipio)}&Sigla=${enc(parsed.tipovia||"CL")}&Calle=${enc(parsed.nomvia)}&Numero=${enc(parsed.numero)}&Piso=${enc(parsed.piso)}`;
+            url=`https://corsproxy.io/?https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP?Provincia=${enc(parsed.provincia)}&Municipio=${enc(parsed.municipio)}&Sigla=${enc(parsed.tipovia||"CL")}&Calle=${enc(parsed.nomvia)}&Numero=${enc(parsed.numero)}&Piso=${enc(parsed.piso)}`;
           }
           const r=await fetch(url,{headers:{"Accept":"application/json"}});
           if(!r.ok) throw new Error(`HTTP ${r.status}`);
