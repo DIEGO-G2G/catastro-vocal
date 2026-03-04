@@ -240,31 +240,46 @@
       }, []);
 
       /* ── Speech Recognition ── */
+      const sessionBaseRef = useRef(""); // text accumulated before current rec session
+
       useEffect(() => {
         const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (!SR) { setSpeechAvail(false); return; }
         const rec = new SR();
-        rec.lang="es-ES"; rec.continuous=true; rec.interimResults=true; rec.maxAlternatives=1;
+        rec.lang="es-ES";
+        rec.continuous = false;      // NON-continuous: more reliable on mobile
+        rec.interimResults = true;
+        rec.maxAlternatives = 1;
+
         rec.onresult = (e) => {
-          let int="";
-          /* Use length of already-accumulated text as dedup guard */
-          const before = transcriptAcc.current;
-          for (let i=0; i<e.results.length; i++) {
-            if (e.results[i].isFinal) {
-              const t = e.results[i][0].transcript.trim();
-              /* Only add if this exact text isn't already the end of accumulator */
-              if (t && !before.includes(t)) {
-                transcriptAcc.current += t + " ";
-              }
-            } else { int += e.results[i][0].transcript; }
+          let finals = "";
+          let interim = "";
+          for (let i = 0; i < e.results.length; i++) {
+            if (e.results[i].isFinal) finals += e.results[i][0].transcript + " ";
+            else interim += e.results[i][0].transcript;
           }
-          if(transcriptAcc.current !== before) setTranscript(transcriptAcc.current);
-          setInterim(int);
+          // Full transcript = what we had before this session + new finals + interim
+          const full = sessionBaseRef.current + finals;
+          if (finals) transcriptAcc.current = full;
+          setTranscript(full || sessionBaseRef.current);
+          setManualText((full || sessionBaseRef.current).trim());
+          setInterim(interim);
         };
 
-        rec.onend=()=>{ if(listenRef.current) setTimeout(()=>{ if(listenRef.current) try{rec.start();}catch(_){} },150); };
-        rec.onerror=(e)=>{ if(e.error==="no-speech"||e.error==="aborted") return; };
-        recRef.current=rec;
+        rec.onend = () => {
+          if (listenRef.current) {
+            // Save accumulated text so next session starts fresh without duplication
+            sessionBaseRef.current = transcriptAcc.current;
+            setTimeout(() => {
+              if (listenRef.current) try { rec.start(); } catch(_) {}
+            }, 200);
+          }
+        };
+
+        rec.onerror = (e) => {
+          if (e.error === "no-speech" || e.error === "aborted") return;
+        };
+        recRef.current = rec;
       }, []);
 
       /* ── PIN input helpers ── */
@@ -327,11 +342,22 @@
       /* ── Mic toggle ── */
       const toggleMic = () => {
         if (isListening) {
-          listenRef.current=false; recRef.current?.stop(); setIsListening(false); setInterim("");
-          const text=transcriptAcc.current.trim();
-          if(text){ setManualText(text); processQuery(text); } else setPhase("idle");
+          listenRef.current=false;
+          recRef.current?.stop();
+          setIsListening(false);
+          setInterim("");
+          // Small delay to let final onresult fire before reading accumulator
+          setTimeout(() => {
+            const text = transcriptAcc.current.trim();
+            if (text) {
+              setManualText(text);
+              processQuery(text);
+            } else {
+              setPhase("idle");
+            }
+          }, 400);
         } else {
-          transcriptAcc.current=""; setTranscript(""); setInterim(""); setResult(null); setErrorMsg(""); if(recRef.current) recRef.current._addedT=new Set();
+          transcriptAcc.current=""; sessionBaseRef.current=""; setTranscript(""); setInterim(""); setResult(null); setErrorMsg("");
           setPhase("listening"); setIsListening(true); listenRef.current=true;
           try{recRef.current?.start();}catch(_){}
         }
@@ -370,46 +396,63 @@
 
       const queryCadastre = async (parsed) => {
         try {
-          if(parsed.tipo==="refcat"){ setResult({rc:parsed.rc.trim(),ldt:"Referencia catastral directa",area:"",uso:""}); setPhase("result"); return; }
-          let baseUrl;
-          if(parsed.tipo==="coordenadas") {
-            baseUrl=`https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR?SRS=EPSG:4326&Latitud=${parsed.lat}&Longitud=${parsed.lon}`;
-          } else {
-            const enc=(v)=>encodeURIComponent(v||"");
-            baseUrl=`https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP?Provincia=${enc(parsed.provincia)}&Municipio=${enc(parsed.municipio)}&Sigla=${enc(parsed.tipovia||"CL")}&Calle=${enc(parsed.nomvia)}&Numero=${enc(parsed.numero)}&Piso=${enc(parsed.piso)}`;
+          if (parsed.tipo === "refcat") {
+            setResult({ rc: parsed.rc.trim(), ldt: "Referencia catastral directa", area: "", uso: "" });
+            setPhase("result"); return;
           }
-          /* Try direct first, then proxies in order */
-          const proxies = [
-            u => u,
-            u => `https://corsproxy.io/?${u}`,
-            u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
+          let baseUrl;
+          if (parsed.tipo === "coordenadas") {
+            baseUrl = `https://ovc.catastro.meh.es/OVCServWeb/OVCWcfLocalizacionRC/COVCLocalizacionRC.svc/json/Consulta_RCCOOR?SRS=EPSG:4326&Latitud=${parsed.lat}&Longitud=${parsed.lon}`;
+          } else {
+            const enc = (v) => encodeURIComponent(v || "");
+            baseUrl = `https://ovc.catastro.meh.es/OVCServWeb/OVCWcfCallejero/COVCCallejero.svc/json/Consulta_DNPPP?Provincia=${enc(parsed.provincia)}&Municipio=${enc(parsed.municipio)}&Sigla=${enc(parsed.tipovia || "CL")}&Calle=${enc(parsed.nomvia)}&Numero=${enc(parsed.numero)}&Piso=${enc(parsed.piso)}`;
+          }
+
+          /* Try three different CORS proxy approaches */
+          const attempts = [
+            () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(baseUrl)}`),
+            () => fetch(`https://corsproxy.io/?${baseUrl}`),
+            () => fetch(`https://thingproxy.freeboard.io/fetch/${baseUrl}`),
           ];
+
           let data = null;
-          for (const proxy of proxies) {
+          for (const attempt of attempts) {
             try {
-              const r = await fetch(proxy(baseUrl), {headers:{"Accept":"application/json"}});
+              const r = await attempt();
               if (!r.ok) continue;
-              const raw = await r.json();
-              /* allorigins wraps response in {contents:"..."} */
-              data = raw.contents ? JSON.parse(raw.contents) : raw;
-              break;
+              const txt = await r.text();
+              data = JSON.parse(txt);
+              if (data) break;
             } catch(_) { continue; }
           }
-          if (!data) throw new Error("Todos los proxies fallaron");
-          let rc="",ldt="",area="",uso="";
-          if(parsed.tipo==="coordenadas") {
-            const c=data?.consulta_coordenadasResult?.coordenadas?.coord;
-            if(c?.pc){rc=(c.pc.pc1||"")+(c.pc.pc2||"");ldt=c.ldt||"";}
+
+          if (!data) throw new Error("Sin datos");
+
+          let rc = "", ldt = "", area = "", uso = "";
+          if (parsed.tipo === "coordenadas") {
+            const c = data?.consulta_coordenadasResult?.coordenadas?.coord;
+            if (c?.pc) { rc = (c.pc.pc1 || "") + (c.pc.pc2 || ""); ldt = c.ldt || ""; }
           } else {
-            const res=data?.consulta_dnpppResult; let bi=res?.bico?.bi;
-            if(Array.isArray(bi)) bi=bi[0];
-            if(bi?.idbi?.rc?.pc1){rc=(bi.idbi.rc.pc1||"")+(bi.idbi.rc.pc2||"");ldt=bi.dt?.ldt||"";area=bi.debi?.sfc?`${bi.debi.sfc} m²`:"";uso=bi.debi?.luso||"";}
+            const res = data?.consulta_dnpppResult;
+            let bi = res?.bico?.bi;
+            if (Array.isArray(bi)) bi = bi[0];
+            if (bi?.idbi?.rc?.pc1) {
+              rc = (bi.idbi.rc.pc1 || "") + (bi.idbi.rc.pc2 || "");
+              ldt = bi.dt?.ldt || "";
+              area = bi.debi?.sfc ? `${bi.debi.sfc} m²` : "";
+              uso = bi.debi?.luso || "";
+            }
           }
-          if(rc.trim().length>=14){ setResult({rc:rc.trim(),ldt,area,uso}); setPhase("result"); }
-          else throw new Error("RC no localizada");
+
+          if (rc.trim().length >= 14) {
+            setResult({ rc: rc.trim(), ldt, area, uso });
+            setPhase("result");
+          } else {
+            throw new Error("Dirección no encontrada en el Catastro");
+          }
         } catch(e) {
-          window.open("https://www1.sedecatastro.gob.es/cycbieninmueble/ovcbusqueda.aspx","_blank");
-          setErrorMsg("La API del Catastro requiere acceso directo (restricción CORS). Se ha abierto la web oficial en una nueva pestaña."); setPhase("error");
+          setErrorMsg(`No se encontró la finca: ${e.message}. Compruebe que la dirección es correcta o pruebe con coordenadas.`);
+          setPhase("error");
         }
       };
 
